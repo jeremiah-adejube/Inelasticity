@@ -1,1 +1,134 @@
+#Mix 1 ( Code converts Dynamic Modulus to Prony Series)
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import nnls
 
+# Paste dynamic modulus data
+frequency = [1000000, 100000, 10000, 1000, 100, 10, 1, 0.1, 0.01, 0.001, 0.0001, 0.00001, 0.000001]
+dynamic_modulus = [3093.966722, 2870.284624, 2524.42809, 2040.523, 1459.974587, 898.2192594, 479.3197043, 237.7387891, 122.2078588, 71.14917, 48.314377, 37.538644, 32.157853]
+
+# Parameters you can modify
+num_terms = 8  # Number of Prony series terms
+output_file = 'abaqus_parameters.txt'  # Output file name
+plot = True  # Generate plots
+
+# Convert frequency to angular frequency (omega)
+omega = 2 * np.pi * np.array(frequency)
+
+# Sort data by frequency (ascending)
+sort_idx = np.argsort(frequency)
+frequency = np.array(frequency)[sort_idx]
+omega = omega[sort_idx]
+dynamic_modulus = np.array(dynamic_modulus)[sort_idx]
+
+# Estimate E_infinity (long-term modulus) from lowest frequency data
+E_infinity = dynamic_modulus[0]
+
+# Estimate E_max (instantaneous modulus) from highest frequency data
+E_max = dynamic_modulus[-1]
+
+print(f"Data frequency range: {frequency[0]:.2e} to {frequency[-1]:.2e} Hz")
+print(f"Estimated E_infinity (long-term modulus): {E_infinity:.4f}")
+print(f"Estimated E_max (instantaneous modulus): {E_max:.4f}")
+
+# Select relaxation times 
+log_min_inverse_freq = np.log10(1/np.max(frequency))
+log_max_inverse_freq = np.log10(1/np.min(frequency))
+log_step = (log_max_inverse_freq - log_min_inverse_freq) / (num_terms - 1)
+
+rho = np.power(10, np.array([log_min_inverse_freq + i * log_step for i in range(num_terms)]))
+print(f"\nSelected {num_terms} relaxation times (seconds):")
+print(rho)
+
+# Set up the linear regression problem to find Ei values
+A = np.zeros((len(omega), num_terms))
+for i, w in enumerate(omega):
+    for j, r in enumerate(rho):
+        # Coefficient for each Ei: (ω²ρᵢ²)/(1+ω²ρᵢ²)
+        w2r2 = (w * r) ** 2
+        A[i, j] = w2r2 / (1 + w2r2)
+
+# The right-hand side is dynamic_modulus - E_infinity
+b = dynamic_modulus - E_infinity
+
+# Solve the non-negative least squares problem
+E_i, rnorm = nnls(A, b)
+
+# Calculate the fitted values
+dynamic_modulus_fitted = E_infinity + A @ E_i
+
+# Calculate error metrics
+rel_error = np.abs(dynamic_modulus_fitted - dynamic_modulus) / dynamic_modulus * 100
+mean_error = np.mean(rel_error)
+max_error = np.max(rel_error)
+
+# Calculate E_0 
+E_0 = E_infinity + np.sum(E_i)
+
+# Calculate g_i 
+g_i = E_i / E_0
+
+# Calculate the sum of g_i (Note: should be close to 1 - E_infinity/E_0)
+sum_g_i = np.sum(g_i)
+expected_sum = 1 - (E_infinity / E_0)
+
+# Output results
+print("\nProny Series Results:")
+print(f"Instantaneous modulus (E_0): {E_0:.4f}")
+print(f"Sum of g_i: {sum_g_i:.6f}")
+print(f"Expected sum (1 - E_infinity/E_0): {expected_sum:.6f}")
+
+print("\nFitting Quality:")
+print(f"Mean Relative Error: {mean_error:.2f}%")
+print(f"Maximum Relative Error: {max_error:.2f}%")
+
+# Print Prony parameters
+print("\nProny Series Coefficients:")
+print("i | E_i | g_i Prony | tau_i Prony (s)")
+print("-" * 40)
+for i in range(num_terms):
+    print(f"{i+1} | {E_i[i]:.4f} | {g_i[i]:.6f} | {rho[i]:.6e}")
+
+# Generate ABAQUS input format
+abaqus_input = "*Material, name=ViscoelasticMaterial\n"
+abaqus_input += f"*Elastic, modulus={E_0:.2f}\n"
+abaqus_input += "*Viscoelastic, time=PRONY\n"
+
+# Only include terms where g_i is significant
+for i in range(num_terms):
+    if g_i[i] > 0.0001:  # Threshold for including a term
+        abaqus_input += f"{g_i[i]:.6f}, 0.000000, {rho[i]:.6e}\n"
+
+# Output ABAQUS format
+print("\nABAQUS Input Format:")
+print(abaqus_input)
+
+# Save to file if requested
+with open(output_file, 'w') as f:
+    f.write(abaqus_input)
+print(f"\nABAQUS input saved to: {output_file}")
+
+# Generate plots
+if plot:
+    # Plot 1: Dynamic modulus vs frequency
+    plt.figure(figsize=(7, 4))
+    plt.loglog(frequency, dynamic_modulus, '*', label='Dynamic Modulus Data')
+    plt.loglog(frequency, dynamic_modulus_fitted, '-', label='Prony Series Fit')
+    plt.xlabel('Frequency (Hz)')
+    plt.ylabel('Dynamic Modulus (ksi)')
+    plt.title('Dynamic Modulus vs Frequency Mix 1')
+    plt.legend()
+    #plt.grid(True, which="both", ls="-")
+    plt.grid(False)
+    plt.show()  
+    
+    # Plot 2: Relative error
+    plt.figure(figsize=(7, 4))
+    plt.semilogx(frequency, rel_error, 'o-')
+    plt.axhline(y=mean_error, color='r', linestyle='--', label=f'Mean Error: {mean_error:.2f}%')
+    plt.xlabel('Frequency (Hz)')
+    plt.ylabel('Relative Error (%)')
+    plt.title('Fitting Error vs Frequency')
+    plt.legend()
+    plt.grid(True)
+    plt.show()  # This displays the plot in the notebook
