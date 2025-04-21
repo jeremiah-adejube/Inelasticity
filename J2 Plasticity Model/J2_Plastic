@@ -1,1 +1,987 @@
+# Mix 3
 
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import minimize
+from scipy.interpolate import interp1d
+from scipy.optimize import nnls
+
+
+def fit_prony_nnls(num_terms=8):
+  
+    frequency = [1e6, 1e5, 1e4, 1e3, 1e2, 10, 1, 0.1, 0.01, 0.001, 0.0001, 1e-5, 1e-6]
+    dynamic_modulus = [3068.89208, 2873.539194, 2588.259804, 2197.398911, 1710.774802, 1182.593063,
+ 705.4054794, 360.1773739, 162.4720639, 69.83214307, 31.46860993, 16.04170075, 9.552223987]
+
+    frequency = np.array(frequency)
+    dynamic_modulus = np.array(dynamic_modulus)
+    omega = 2 * np.pi * frequency
+
+    # Sort by frequency
+    sort_idx = np.argsort(frequency)
+    frequency = frequency[sort_idx]
+    omega = omega[sort_idx]
+    dynamic_modulus = dynamic_modulus[sort_idx]
+
+    # Set E_inf to minimum dynamic modulus to ensure positive E_i
+    E_inf = min(dynamic_modulus) * 0.9
+    if E_inf <= 0:
+        E_inf = 1.0  # Fallback to ensure positive
+
+    # Define relaxation times logarithmically spaced
+    log_min = np.log10(1 / np.max(frequency))
+    log_max = np.log10(1 / np.min(frequency))
+    rho_i = 10 ** np.linspace(log_min, log_max, num_terms)
+
+    # Construct matrix A for nnls
+    A = np.zeros((len(omega), num_terms))
+    for i, w in enumerate(omega):
+        for j, r in enumerate(rho_i):
+            A[i, j] = (w * r)**2 / (1 + (w * r)**2)
+
+    # Solve for E_i using non-negative least squares
+    b = dynamic_modulus - E_inf
+    E_i, _ = nnls(A, b)
+
+    # Ensure E_i is strictly positive
+    E_i = np.maximum(E_i, 1e-6)  # Add small positive offset
+    E_i += 1.0  # Ensure all values are sufficiently positive
+
+    print(f"fit_prony_nnls: E_inf = {E_inf}, E_i = {E_i}, rho_i = {rho_i}")
+
+    return E_inf, E_i, rho_i
+
+
+class ViscoelasticPlasticModel:
+ 
+    
+    def __init__(self, E_inf, E_i, rho_i, nu, yield_stress, 
+                 hardening_type='isotropic', hardening_params=None, 
+                 reference_temp=20.0):
+
+        # Input validation
+        if not (E_inf > 0):
+            raise ValueError(f"E_inf must be positive, got {E_inf}")
+        E_i = np.array(E_i)
+        rho_i = np.array(rho_i)
+        if len(E_i) != len(rho_i):
+            raise ValueError(f"E_i and rho_i must have the same length, got {len(E_i)} and {len(rho_i)}")
+        if not (np.all(E_i > 0) and np.all(rho_i > 0)):
+            raise ValueError(f"E_i and rho_i must be positive, got E_i={E_i}, rho_i={rho_i}")
+        if not (0 < nu < 0.5):
+            raise ValueError(f"Poisson's ratio must be between 0 and 0.5, got {nu}")
+        if yield_stress <= 0:
+            raise ValueError(f"yield_stress must be positive, got {yield_stress}")
+        if hardening_type not in ['isotropic', 'kinematic', 'mixed']:
+            raise ValueError(f"hardening_type must be 'isotropic', 'kinematic', or 'mixed', got {hardening_type}")
+
+        # Store viscoelastic parameters
+        self.E_inf = E_inf
+        self.E_i = E_i
+        self.rho_i = rho_i
+        self.num_branches = len(E_i)
+        
+        # Instantaneous elastic modulus
+        self.E_0 = E_inf + np.sum(E_i)
+        
+        # Elastic properties
+        self.nu = nu
+        self.G_0 = self.E_0 / (2 * (1 + nu))  # Shear modulus
+        self.K_0 = self.E_0 / (3 * (1 - 2 * nu))  # Bulk modulus
+        
+        # Plastic parameters
+        self.yield_stress = yield_stress
+        self.kappa = yield_stress  # Current yield strength
+        self.hardening_type = hardening_type
+        self.hardening_params = hardening_params or {}
+        
+        # Set default hardening parameters with larger b for stability
+        if hardening_type == 'isotropic' and 'a' not in self.hardening_params:
+            self.hardening_params = {'a': 100.0, 'b': 10.0 * yield_stress, 'c': 0.7}
+        elif hardening_type == 'kinematic' and 'c' not in self.hardening_params:
+            self.hardening_params = {'c': 0.6 * self.G_0, 'gamma': 0.0}
+        elif hardening_type == 'mixed' and ('a' not in self.hardening_params or 'c_kin' not in self.hardening_params):
+            self.hardening_params = {
+                'a': 50.0, 'b': 10.0 * yield_stress, 'c': 0.7,  # Isotropic
+                'c_kin': 0.3 * self.G_0, 'gamma': 0.0  # Kinematic
+            }
+        
+        # Initialize state variables
+        self.reset_internal_variables()
+        
+        # Temperature parameters
+        self.reference_temp = reference_temp
+        self.current_temp = reference_temp
+        self.activation_energy = 195287.0  # J/mol
+        self.gas_constant = 8.314  # J/(mol*K)
+
+    def reset_internal_variables(self):
+        """Reset state variables to initial conditions."""
+        self.plastic_strain = 0.0
+        self.plastic_strain_tensor = np.zeros(6)
+        self.back_stress = np.zeros(6)
+        self.ve_branch_strains = np.zeros((self.num_branches, 6))
+        self.kappa = self.yield_stress
+
+    def elastic_stiffness_matrix(self, modulus=None):
+     
+        E = modulus if modulus is not None else self.E_0
+        nu = self.nu
+        G = E / (2 * (1 + nu))
+        lmbda = E * nu / ((1 + nu) * (1 - 2 * nu))
+        
+        C = np.zeros((6, 6))
+        for i in range(3):
+            C[i, i] = lmbda + 2 * G
+            for j in range(3):
+                if i != j:
+                    C[i, j] = lmbda
+        for i in range(3, 6):
+            C[i, i] = G
+        return C
+
+    def elastic_compliance_matrix(self, modulus=None):
+   
+        E = modulus if modulus is not None else self.E_0
+        nu = self.nu
+        S = np.zeros((6, 6))
+        for i in range(3):
+            S[i, i] = 1 / E
+            for j in range(3):
+                if i != j:
+                    S[i, j] = -nu / E
+        for i in range(3, 6):
+            S[i, i] = 2 * (1 + nu) / E
+        return S
+
+    def set_temperature(self, temperature):
+  
+        self.current_temp = temperature
+
+    def get_shift_factor(self, temperature=None):
+
+        T = temperature if temperature is not None else self.current_temp
+        T_K = T + 273.15
+        T_ref_K = self.reference_temp + 273.15
+        return np.exp((self.activation_energy / self.gas_constant) * (1/T_K - 1/T_ref_K))
+
+    def adjusted_relaxation_times(self, temperature=None):
+    
+        return self.rho_i * self.get_shift_factor(temperature)
+
+    def temperature_adjusted_yield_stress(self, temperature=None):
+      
+        T = temperature if temperature is not None else self.current_temp
+        temperature_factor = max(0.1, 1.0 - 0.02 * (T - self.reference_temp))
+        return self.yield_stress * temperature_factor
+
+    def yield_function(self, stress):
+     
+        if self.hardening_type == 'isotropic':
+            J2 = self.calculate_J2(stress)
+            return np.sqrt(3 * J2) - self.kappa
+        else:  # kinematic or mixed
+            relative_stress = stress - self.back_stress
+            J2 = self.calculate_J2(relative_stress)
+            return np.sqrt(3 * J2) - (self.kappa if self.hardening_type == 'mixed' else self.yield_stress)
+
+    def calculate_J2(self, stress):
+     
+        dev_stress = self.deviatoric_stress(stress)
+        return 0.5 * (dev_stress[0]**2 + dev_stress[1]**2 + dev_stress[2]**2) + \
+               dev_stress[3]**2 + dev_stress[4]**2 + dev_stress[5]**2
+
+    def deviatoric_stress(self, stress):
+     
+        p = (stress[0] + stress[1] + stress[2]) / 3
+        dev_stress = stress.copy()
+        dev_stress[:3] -= p
+        return dev_stress
+
+    def update_hardening(self, plastic_flow_dir, delta_plastic_strain):
+      
+        if delta_plastic_strain <= 0:
+            return
+        
+        self.plastic_strain += delta_plastic_strain
+        self.plastic_strain_tensor += delta_plastic_strain * plastic_flow_dir
+        
+        if self.hardening_type in ['isotropic', 'mixed']:
+            a, b, c = self.hardening_params['a'], self.hardening_params['b'], self.hardening_params['c']
+            # Clamp to ensure numerical stability
+            self.kappa += a * max(1e-10, (1 - min(self.kappa / b, 0.999))**c) * delta_plastic_strain
+        
+        if self.hardening_type in ['kinematic', 'mixed']:
+            c = self.hardening_params['c_kin'] if self.hardening_type == 'mixed' else self.hardening_params['c']
+            gamma = self.hardening_params['gamma']
+            self.back_stress += (c * plastic_flow_dir - gamma * self.back_stress) * delta_plastic_strain
+
+    def relaxation_modulus(self, t, temperature=None):
+     
+        rho_i_T = self.adjusted_relaxation_times(temperature)
+        t = np.asarray(t)
+        return self.E_inf + np.sum(self.E_i[:, None] * np.exp(-t / rho_i_T[:, None]), axis=0) if t.ndim > 0 else \
+               self.E_inf + np.sum(self.E_i * np.exp(-t / rho_i_T))
+
+    def creep_compliance(self, t, temperature=None):
+     
+        rho_i_T = self.adjusted_relaxation_times(temperature)
+        j_i = self.E_i / self.E_0
+        t = np.asarray(t)
+        return 1.0 / self.E_0 + np.sum(j_i[:, None] / self.E_0 * (1 - np.exp(-t / rho_i_T[:, None])), axis=0) if t.ndim > 0 else \
+               1.0 / self.E_0 + np.sum(j_i / self.E_0 * (1 - np.exp(-t / rho_i_T)))
+
+    def update_viscoelastic_strains(self, stress, stress_increment, dt):
+     
+        S = self.elastic_compliance_matrix(self.E_0)
+        elastic_strain_increment = np.dot(S, stress_increment)
+        
+        for i in range(self.num_branches):
+            rho_i_T = self.adjusted_relaxation_times()[i]
+            decay = np.exp(-dt / rho_i_T)
+            S_i = self.elastic_compliance_matrix(self.E_i[i])
+            self.ve_branch_strains[i] = self.ve_branch_strains[i] * decay + np.dot(S_i, stress) * (1 - decay)
+
+    def calculate_viscoelastic_strain(self):
+        """
+        Compute total viscoelastic strain.
+
+        Returns:
+        -------
+        array_like
+            Viscoelastic strain tensor
+        """
+        return np.sum(self.ve_branch_strains, axis=0)
+
+    def stress_update(self, stress, strain_increment, dt):
+      
+        if np.all(np.abs(strain_increment) < 1e-12):
+            self.update_viscoelastic_strains(stress, np.zeros_like(stress), dt)
+            return stress
+        
+        C = self.elastic_stiffness_matrix()
+        trial_stress = stress + np.dot(C, strain_increment)
+        f_trial = self.yield_function(trial_stress)
+        
+        if f_trial <= 0:
+            self.update_viscoelastic_strains(stress, trial_stress - stress, dt)
+            return trial_stress
+        
+        # Plastic step: compute flow direction
+        dev_stress = self.deviatoric_stress(trial_stress if self.hardening_type == 'isotropic' else trial_stress - self.back_stress)
+        norm_dev = np.sqrt(2 * self.calculate_J2(dev_stress))
+        if norm_dev < 1e-10:
+            self.update_viscoelastic_strains(stress, trial_stress - stress, dt)
+            return trial_stress
+        
+        flow_dir = dev_stress / norm_dev
+
+        # Newton-Raphson to find plastic multiplier
+        def residual(gamma):
+            temp_kappa = self.kappa
+            temp_back_stress = self.back_stress.copy()
+            if self.hardening_type == 'isotropic':
+                a, b, c = self.hardening_params['a'], self.hardening_params['b'], self.hardening_params['c']
+                if gamma > 0:
+                    temp_kappa += a * max(1e-10, (1 - min(temp_kappa / b, 0.999))**c) * gamma
+            elif self.hardening_type == 'kinematic':
+                c_kin, gamma_kin = self.hardening_params['c'], self.hardening_params['gamma']
+                temp_back_stress += (c_kin * flow_dir - gamma_kin * temp_back_stress) * gamma
+            else:  # mixed
+                a, b, c = self.hardening_params['a'], self.hardening_params['b'], self.hardening_params['c']
+                c_kin, gamma_kin = self.hardening_params['c_kin'], self.hardening_params['gamma']
+                if gamma > 0:
+                    temp_kappa += a * max(1e-10, (1 - min(temp_kappa / b, 0.999))**c) * gamma
+                temp_back_stress += (c_kin * flow_dir - gamma_kin * temp_back_stress) * gamma
+            
+            corrected_stress = trial_stress - gamma * np.dot(C, flow_dir)
+            rel_stress = corrected_stress - temp_back_stress
+            return np.sqrt(3 * self.calculate_J2(rel_stress if self.hardening_type != 'isotropic' else corrected_stress)) - \
+                   (temp_kappa if self.hardening_type != 'kinematic' else self.yield_stress)
+
+        gamma = 0.0
+        for _ in range(20):  # Max iterations
+            r = residual(gamma)
+            if abs(r) < 1e-10:  # Tighter tolerance
+                break
+            dr = (residual(gamma + 1e-8) - r) / 1e-8  # Smaller step for numerical derivative
+            if abs(dr) < 1e-12:  # Tighter check for small derivative
+                break
+            gamma_new = gamma - r / dr
+            gamma = max(0, gamma_new)  # Enforce non-negativity
+        
+        gamma = max(0, gamma)
+        self.update_hardening(flow_dir, gamma)
+        corrected_stress = trial_stress - gamma * np.dot(C, flow_dir)
+        self.update_viscoelastic_strains(stress, corrected_stress - stress, dt)
+        return corrected_stress
+
+    def simulate_uniaxial_tension(self, max_strain, strain_rate=0.01, temperature=None):
+      
+        if temperature is not None:
+            self.set_temperature(temperature)
+        
+        total_time = max_strain / strain_rate
+        num_steps = 100
+        dt = total_time / num_steps
+        time_points = np.linspace(0, total_time, num_steps)
+        strain_points = np.linspace(0, max_strain, num_steps)
+        strain_increments = np.diff(np.append(0, strain_points))
+        
+        stress_points = np.zeros(num_steps)
+        plastic_strain_points = np.zeros(num_steps)
+        viscoelastic_strain_points = np.zeros(num_steps)
+        
+        stress = np.zeros(6)
+        self.reset_internal_variables()
+        self.kappa = self.temperature_adjusted_yield_stress()
+        
+        for i, delta_strain in enumerate(strain_increments):
+            strain_increment = np.zeros(6)
+            strain_increment[0] = delta_strain
+            stress = self.stress_update(stress, strain_increment, dt)
+            ve_strain = self.calculate_viscoelastic_strain()
+            stress_points[i] = stress[0]
+            plastic_strain_points[i] = self.plastic_strain
+            viscoelastic_strain_points[i] = ve_strain[0]
+        
+        return time_points, strain_points, stress_points, plastic_strain_points, viscoelastic_strain_points
+
+    def simulate_cyclic_loading(self, max_strain, frequency=0.1, num_cycles=1, temperature=None):
+   
+        if temperature is not None:
+            self.set_temperature(temperature)
+        
+        total_time = num_cycles / frequency
+        points_per_cycle = 40
+        num_steps = points_per_cycle * num_cycles
+        dt = total_time / num_steps
+        time_points = np.linspace(0, total_time, num_steps)
+        strain_points = max_strain * np.sin(2 * np.pi * frequency * time_points)
+        strain_increments = np.diff(np.append(0, strain_points))
+        
+        stress_points = np.zeros(num_steps)
+        plastic_strain_points = np.zeros(num_steps)
+        viscoelastic_strain_points = np.zeros(num_steps)
+        
+        stress = np.zeros(6)
+        self.reset_internal_variables()
+        self.kappa = self.temperature_adjusted_yield_stress()
+        
+        for i, delta_strain in enumerate(strain_increments):
+            strain_increment = np.zeros(6)
+            strain_increment[0] = delta_strain
+            stress = self.stress_update(stress, strain_increment, dt)
+            ve_strain = self.calculate_viscoelastic_strain()
+            stress_points[i] = stress[0]
+            plastic_strain_points[i] = self.plastic_strain
+            viscoelastic_strain_points[i] = ve_strain[0]
+        
+        return time_points, strain_points, stress_points, plastic_strain_points, viscoelastic_strain_points
+
+    def simulate_creep_recovery(self, applied_stress, loading_time, recovery_time, 
+                               temperature=None, num_steps=200, creep_rate_factor=1e-5):
+ 
+        if temperature is not None:
+            self.set_temperature(temperature)
+        
+        total_time = loading_time + recovery_time
+        time_points = np.linspace(0, total_time, num_steps)
+        dt = total_time / (num_steps - 1)
+        
+        strain_points = np.zeros(num_steps)
+        plastic_strain_points = np.zeros(num_steps)
+        viscoelastic_strain_points = np.zeros(num_steps)
+        elastic_strain_points = np.zeros(num_steps)
+        
+        stress = np.zeros(6)
+        prev_stress = np.zeros(6)
+        self.reset_internal_variables()
+        self.kappa = self.temperature_adjusted_yield_stress()
+        S = self.elastic_compliance_matrix(self.E_0)
+        
+        for i, t in enumerate(time_points):
+            stress[0] = applied_stress if t <= loading_time else 0.0
+            f = self.yield_function(stress)
+            
+            if f > 0 and t <= loading_time:
+                dev_stress = self.deviatoric_stress(stress if self.hardening_type == 'isotropic' else stress - self.back_stress)
+                norm_dev = np.sqrt(2 * self.calculate_J2(dev_stress))
+                if norm_dev > 1e-10:
+                    flow_dir = dev_stress / norm_dev
+                    creep_rate = creep_rate_factor * (f / self.yield_stress)**3.0
+                    delta_plastic_strain = creep_rate * dt
+                    self.update_hardening(flow_dir, delta_plastic_strain)
+            
+            stress_increment = stress - prev_stress
+            self.update_viscoelastic_strains(stress, stress_increment, dt)
+            ve_strain = self.calculate_viscoelastic_strain()
+            elastic_strain = np.dot(S, stress)
+            
+            strain_points[i] = elastic_strain[0] + ve_strain[0] + self.plastic_strain
+            plastic_strain_points[i] = self.plastic_strain
+            viscoelastic_strain_points[i] = ve_strain[0]
+            elastic_strain_points[i] = elastic_strain[0]
+            
+            prev_stress = stress.copy()
+        
+        return time_points, strain_points, plastic_strain_points, viscoelastic_strain_points, elastic_strain_points
+
+    def simulate_temperature_sweep(self, stress_level, temperature_range, num_points=20, hold_time=10.0):
+       
+        min_temp, max_temp = temperature_range
+        temperatures = np.linspace(min_temp, max_temp, num_points)
+        strain_points = np.zeros(num_points)
+        plastic_strain_points = np.zeros(num_points)
+        viscoelastic_strain_points = np.zeros(num_points)
+        elastic_strain_points = np.zeros(num_points)
+        
+        for i, temp in enumerate(temperatures):
+            _, strain, plastic, viscoelastic, elastic = self.simulate_creep_recovery(
+                stress_level, hold_time, 0.0, temp, num_steps=50)
+            strain_points[i] = strain[-1]
+            plastic_strain_points[i] = plastic[-1]
+            viscoelastic_strain_points[i] = viscoelastic[-1]
+            elastic_strain_points[i] = elastic[-1]
+        
+        return temperatures, strain_points, plastic_strain_points, viscoelastic_strain_points, elastic_strain_points
+
+
+def example_usage():
+    """
+    Demonstrate model usage with various tests and plots.
+    """
+    # Get Prony series parameters
+    E_inf, E_i, rho_i = fit_prony_nnls(num_terms=8)
+
+    nu = 0.35
+    yield_stress = 13  # MPa
+
+    # Initialize models with consistent parameters
+    models = [
+        ViscoelasticPlasticModel(
+            E_inf, E_i, rho_i, nu, yield_stress, 'isotropic',
+            {'a': 100.0, 'b': 10.0 * yield_stress, 'c': 0.7}
+        ),
+        ViscoelasticPlasticModel(
+            E_inf, E_i, rho_i, nu, yield_stress, 'kinematic',
+            {'c': 0.6 * (E_inf + np.sum(E_i)) / (2 * (1 + nu)), 'gamma': 0.0}
+        ),
+        ViscoelasticPlasticModel(
+            E_inf, E_i, rho_i, nu, yield_stress, 'mixed',
+            {'a': 50.0, 'b': 10.0 * yield_stress, 'c': 0.7, 'c_kin': 0.3 * (E_inf + np.sum(E_i)) / (2 * (1 + nu)), 'gamma': 0.0}
+        )
+    ]
+    
+    plt.figure(figsize=(18, 10))
+    
+    # Uniaxial tension
+    plt.subplot(2, 3, 1)
+    for model, label, color in zip(models, ['Isotropic', 'Kinematic', 'Mixed'], ['b', 'r', 'g']):
+        time, strain, stress, _, _ = model.simulate_uniaxial_tension(0.05, 0.01, 20.0)
+        plt.plot(strain, stress, color, label=label)
+    plt.xlabel('Strain')
+    plt.ylabel('Stress (MPa)')
+    plt.title('Uniaxial Tension (20°C)')
+    plt.legend()
+    plt.grid(True)
+    
+    # Cyclic loading
+    plt.subplot(2, 3, 2)
+    for model, label, color in zip(models, ['Isotropic', 'Kinematic', 'Mixed'], ['b', 'r', 'g']):
+        time, strain, stress, _, _ = model.simulate_cyclic_loading(0.05, 0.2, 15, 20.0)
+        plt.plot(strain, stress, color, label=label)
+    plt.xlabel('Strain')
+    plt.ylabel('Stress (MPa)')
+    plt.title('Cyclic Loading (20°C)')
+    plt.legend()
+    plt.grid(True)
+    
+    # Creep-recovery
+    plt.subplot(2, 3, 3)
+    for model, label, color in zip(models, ['Mixed'], ['b', 'r', 'g']):
+        time, strain, _, _, _ = model.simulate_creep_recovery(0.7, 50.0, 50.0, 20.0)
+        plt.plot(time, strain, color, label=label)
+    plt.axvline(x=50.0, color='k', linestyle='--')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Strain')
+    plt.title('Creep-Recovery (20°C)')
+    plt.legend()
+    plt.grid(True)
+    
+    # Strain decomposition (mixed hardening)
+    plt.subplot(2, 3, 4)
+    time, strain, plastic, ve_strain, elastic = models[2].simulate_creep_recovery(0.7, 50.0, 50.0, 20.0)
+    plt.plot(time, strain, 'k-', label='Total')
+    plt.plot(time, elastic, 'b-', label='Elastic')
+    plt.plot(time, ve_strain, 'g-', label='Viscoelastic')
+    plt.plot(time, plastic, 'r-', label='Plastic')
+    plt.axvline(x=50.0, color='k', linestyle='--')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Strain')
+    plt.title('Strain Decomposition (Mixed Hardening)')
+    plt.legend()
+    plt.grid(True)
+    
+    # Temperature effect on creep
+    plt.subplot(2, 3, 5)
+    for temp, color in zip([0.0, 20.0, 40.0, 60.0], ['b', 'g', 'orange', 'r']):
+        time, strain, _, _, _ = models[2].simulate_creep_recovery(0.7, 50.0, 0.0, temp)
+        plt.plot(time, strain, color, label=f'{temp}°C')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Strain')
+    plt.title('Temperature Effect on Creep')
+    plt.legend()
+    plt.grid(True)
+    
+    # Temperature sweep
+    plt.subplot(2, 3, 6)
+    temps, total_strain, plastic, ve_strain, elastic = models[2].simulate_temperature_sweep(
+        0.7, (0.0, 60.0), 30, 10.0)
+    plt.plot(temps, total_strain, 'k-', label='Total')
+    plt.plot(temps, elastic, 'b-', label='Elastic')
+    plt.plot(temps, ve_strain, 'g-', label='Viscoelastic')
+    plt.plot(temps, plastic, 'r-', label='Plastic')
+    plt.xlabel('Temperature (°C)')
+    plt.ylabel('Equilibrium Strain')
+    plt.title('Temperature Sweep (0.7 MPa)')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig('vep_model_results.png', dpi=300)
+    plt.show()
+
+
+def calibrate_to_ideal_ct(file_path, model_type='mixed'):
+ 
+    try:
+        data = np.loadtxt(file_path, skiprows=1, delimiter=',')
+        time = data[:, 1]
+        load = data[:, 2]
+        displacement = data[:, 5]
+        
+        with open(file_path, 'r') as f:
+            lines = f.readlines()
+            diameter = thickness = None
+            for line in lines:
+                if 'Diameter' in line:
+                    diameter = float(line.split(',')[1])
+                elif 'Thickness' in line:
+                    thickness = float(line.split(',')[1])
+            if diameter is None or thickness is None:
+                raise ValueError("Diameter or Thickness not found in file")
+        
+        area = np.pi * (diameter/2)**2 / 1e6
+        stress = load * 1000 / area
+        strain = displacement / thickness
+    except Exception as e:
+        raise ValueError(f"Error reading file: {e}")
+    
+    # Use Prony series parameters from fit_prony_nnls
+    E_inf, E_i, rho_i = fit_prony_nnls(num_terms=8)
+    nu = 0.35
+    
+    if model_type == 'isotropic':
+        def objective(params):
+            yield_stress, a, b, c = params
+            model = ViscoelasticPlasticModel(E_inf, E_i, rho_i, nu, yield_stress, 'isotropic',
+                                             {'a': a, 'b': b, 'c': c})
+            _, model_strain, model_stress, _, _ = model.simulate_uniaxial_tension(np.max(strain), np.max(strain)/np.max(time))
+            interp_func = interp1d(model_strain, model_stress, bounds_error=False, fill_value="extrapolate")
+            return np.sum((interp_func(strain) - stress)**2)
+        
+        initial_guess = [0.8, 100.0, 10.0, 0.7]
+        bounds = [(0.1, 2.0), (10.0, 500.0), (0.5, 20.0), (0.1, 2.0)]
+        result = minimize(objective, initial_guess, bounds=bounds, method='L-BFGS-B')
+        yield_stress, a, b, c = result.x
+        model = ViscoelasticPlasticModel(E_inf, E_i, rho_i, nu, yield_stress, 'isotropic',
+                                         {'a': a, 'b': b, 'c': c})
+    
+    elif model_type == 'kinematic':
+        def objective(params):
+            yield_stress, c, gamma = params
+            model = ViscoelasticPlasticModel(E_inf, E_i, rho_i, nu, yield_stress, 'kinematic',
+                                             {'c': c, 'gamma': gamma})
+            _, model_strain, model_stress, _, _ = model.simulate_uniaxial_tension(np.max(strain), np.max(strain)/np.max(time))
+            interp_func = interp1d(model_strain, model_stress, bounds_error=False, fill_value="extrapolate")
+            return np.sum((interp_func(strain) - stress)**2)
+        
+        initial_guess = [0.8, 300.0, 0.0]
+        bounds = [(0.1, 2.0), (50.0, 1000.0), (0.0, 10.0)]
+        result = minimize(objective, initial_guess, bounds=bounds, method='L-BFGS-B')
+        yield_stress, c, gamma = result.x
+        model = ViscoelasticPlasticModel(E_inf, E_i, rho_i, nu, yield_stress, 'kinematic',
+                                         {'c': c, 'gamma': gamma})
+    
+    else:  # mixed
+        def objective(params):
+            yield_stress, a, b, c, c_kin, gamma = params
+            model = ViscoelasticPlasticModel(E_inf, E_i, rho_i, nu, yield_stress, 'mixed',
+                                             {'a': a, 'b': b, 'c': c, 'c_kin': c_kin, 'gamma': gamma})
+            _, model_strain, model_stress, _, _ = model.simulate_uniaxial_tension(np.max(strain), np.max(strain)/np.max(time))
+            interp_func = interp1d(model_strain, model_stress, bounds_error=False, fill_value="extrapolate")
+            return np.sum((interp_func(strain) - stress)**2)
+        
+        initial_guess = [0.8, 50.0, 10.0, 0.7, 150.0, 0.0]
+        bounds = [(0.1, 2.0), (10.0, 200.0), (0.5, 20.0), (0.1, 2.0), (50.0, 500.0), (0.0, 10.0)]
+        result = minimize(objective, initial_guess, bounds=bounds, method='L-BFGS-B')
+        yield_stress, a, b, c, c_kin, gamma = result.x
+        model = ViscoelasticPlasticModel(E_inf, E_i, rho_i, nu, yield_stress, 'mixed',
+                                         {'a': a, 'b': b, 'c': c, 'c_kin': c_kin, 'gamma': gamma})
+    
+    plt.figure(figsize=(10, 6))
+    _, model_strain, model_stress, _, _ = model.simulate_uniaxial_tension(np.max(strain), np.max(strain)/np.max(time))
+    plt.plot(strain, stress, 'ko', label='IDEAL-CT Data')
+    plt.plot(model_strain, model_stress, 'r-', label=f'Calibrated Model ({model_type})')
+    plt.xlabel('Strain')
+    plt.ylabel('Stress (MPa)')
+    plt.title('Calibration to IDEAL-CT Data')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('vep_calibration_results.png', dpi=300)
+    plt.show()
+    
+    return model
+
+
+def compare_ve_vs_vep():
+   
+    # Get Prony series parameters
+    E_inf, E_i, rho_i = fit_prony_nnls(num_terms=8)
+    nu = 0.35
+    yield_stress = 5  # MPa for the plastic model
+
+    # Create two models:
+    # 1. Regular viscoelastic-plastic model with mixed hardening
+    vep_model = ViscoelasticPlasticModel(
+        E_inf, E_i, rho_i, nu, yield_stress, 'mixed',
+        {'a': 50.0, 'b': 10.0 * yield_stress, 'c': 0.7, 
+         'c_kin': 0.3 * (E_inf + np.sum(E_i)) / (2 * (1 + nu)), 'gamma': 0.0}
+    )
+    
+    # 2. Pure viscoelastic model by setting a very high yield stress
+    high_yield = 1000.0  # Extremely high yield stress to prevent yielding
+    ve_model = ViscoelasticPlasticModel(
+        E_inf, E_i, rho_i, nu, high_yield, 'mixed',
+        {'a': 50.0, 'b': 10.0 * high_yield, 'c': 0.7, 
+         'c_kin': 0.3 * (E_inf + np.sum(E_i)) / (2 * (1 + nu)), 'gamma': 0.0}
+    )
+    
+    # Create a figure with multiple comparison plots
+    plt.figure(figsize=(18, 15))
+    
+    # 1. Uniaxial tension comparison
+    plt.subplot(3, 2, 1)
+    max_strain = 0.05
+    strain_rate = 0.01
+    temp = 20.0
+    
+    _, ve_strain, ve_stress, _, _ = ve_model.simulate_uniaxial_tension(max_strain, strain_rate, temp)
+    _, vep_strain, vep_stress, vep_plastic, vep_ve_strain = vep_model.simulate_uniaxial_tension(max_strain, strain_rate, temp)
+    
+    plt.plot(ve_strain, ve_stress, 'b-', linewidth=2, label='Viscoelastic Only')
+    plt.plot(vep_strain, vep_stress, 'r-', linewidth=2, label='Viscoelastic-Plastic')
+    plt.xlabel('Strain')
+    plt.ylabel('Stress (MPa)')
+    plt.title('Uniaxial Tension Comparison (20°C)')
+    plt.legend()
+    plt.grid(True)
+    
+    # 2. Strain decomposition in VEP model
+    plt.subplot(3, 2, 2)
+    elastic_strain = vep_strain - vep_plastic - vep_ve_strain
+    plt.plot(vep_strain, vep_stress, 'k-', label='Stress-Strain Curve')
+    plt.plot(vep_strain, vep_plastic, 'r--', label='Plastic Strain')
+    plt.plot(vep_strain, vep_ve_strain, 'g--', label='Viscoelastic Strain')
+    plt.plot(vep_strain, elastic_strain, 'b--', label='Elastic Strain')
+    plt.xlabel('Total Strain')
+    plt.ylabel('Stress (MPa) / Strain Components')
+    plt.title('Strain Decomposition in VE-Plastic Model')
+    plt.legend()
+    plt.grid(True)
+    
+    # 3. Cyclic loading comparison
+    plt.subplot(3, 2, 3)
+    max_strain = 0.03
+    frequency = 0.1
+    cycles = 3
+    
+    ve_time, ve_strain, ve_stress, _, _ = ve_model.simulate_cyclic_loading(max_strain, frequency, cycles, temp)
+    vep_time, vep_strain, vep_stress, _, _ = vep_model.simulate_cyclic_loading(max_strain, frequency, cycles, temp)
+    
+    plt.plot(ve_strain, ve_stress, 'b-', linewidth=2, label='Viscoelastic Only')
+    plt.plot(vep_strain, vep_stress, 'r-', linewidth=2, label='Viscoelastic-Plastic')
+    plt.xlabel('Strain')
+    plt.ylabel('Stress (MPa)')
+    plt.title('Cyclic Loading Comparison (20°C)')
+    plt.legend()
+    plt.grid(True)
+    
+    # 4. Creep-recovery comparison
+    plt.subplot(3, 2, 4)
+    applied_stress = 10  # MPa
+    loading_time = 50.0  # s
+    recovery_time = 50.0  # s
+    
+    ve_time, ve_strain, ve_plastic, ve_ve_strain, ve_elastic = ve_model.simulate_creep_recovery(
+        applied_stress, loading_time, recovery_time, temp)
+    vep_time, vep_strain, vep_plastic, vep_ve_strain, vep_elastic = vep_model.simulate_creep_recovery(
+        applied_stress, loading_time, recovery_time, temp)
+    
+    plt.plot(ve_time, ve_strain, 'b-', linewidth=2, label='Viscoelastic Only')
+    plt.plot(vep_time, vep_strain, 'r-', linewidth=2, label='Viscoelastic-Plastic')
+    plt.axvline(x=loading_time, color='k', linestyle='--')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Strain')
+    plt.title('Creep-Recovery Comparison (20°C)')
+    plt.legend()
+    plt.grid(True)
+    
+    # 5. Temperature effect comparison
+    plt.subplot(3, 2, 5)
+    temperatures = [0.0, 20.0, 40.0, 60.0]
+    
+    for temp, linestyle in zip(temperatures, ['-', '--', '-.', ':']):
+        ve_time, ve_strain, _, _, _ = ve_model.simulate_creep_recovery(applied_stress, loading_time, 0.0, temp)
+        vep_time, vep_strain, _, _, _ = vep_model.simulate_creep_recovery(applied_stress, loading_time, 0.0, temp)
+        
+        plt.plot(ve_time, ve_strain, 'b'+linestyle, label=f'VE {temp}°C')
+        plt.plot(vep_time, vep_strain, 'r'+linestyle, label=f'VEP {temp}°C')
+    
+    plt.xlabel('Time (s)')
+    plt.ylabel('Strain')
+    plt.title('Temperature Effect on Creep')
+    plt.legend()
+    plt.grid(True)
+    
+    # 6. Permanent deformation comparison
+    plt.subplot(3, 2, 6)
+    max_strain_values = [0.01, 0.02, 0.03, 0.04, 0.05]
+    ve_permanent = []
+    vep_permanent = []
+    
+    for m_strain in max_strain_values:
+        # For VE model
+        ve_time, ve_strain, ve_stress, _, _ = ve_model.simulate_cyclic_loading(m_strain, 0.1, 1, 20.0)
+        # Get final strain value after full cycle
+        ve_permanent.append(ve_strain[-1])
+        
+        # For VEP model
+        vep_time, vep_strain, vep_stress, vep_plastic, _ = vep_model.simulate_cyclic_loading(m_strain, 0.1, 1, 20.0)
+        vep_permanent.append(vep_strain[-1])
+    
+    plt.plot(max_strain_values, ve_permanent, 'bo-', linewidth=2, label='Viscoelastic Only')
+    plt.plot(max_strain_values, vep_permanent, 'ro-', linewidth=2, label='Viscoelastic-Plastic')
+    plt.xlabel('Max Applied Strain')
+    plt.ylabel('Permanent Strain After 1 Cycle')
+    plt.title('Permanent Deformation Comparison')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig('ve_vs_vep_comparison.png', dpi=300)
+    plt.show()
+
+
+def plot_frequency_domain_comparison():
+   
+    # Get Prony series parameters
+    E_inf, E_i, rho_i = fit_prony_nnls(num_terms=8)
+    nu = 0.35
+    yield_stress = 13  # MPa for the plastic model
+
+    # Create two models
+    vep_model = ViscoelasticPlasticModel(
+        E_inf, E_i, rho_i, nu, yield_stress, 'mixed',
+        {'a': 50.0, 'b': 10.0 * yield_stress, 'c': 0.7, 
+         'c_kin': 0.3 * (E_inf + np.sum(E_i)) / (2 * (1 + nu)), 'gamma': 0.0}
+    )
+    
+    high_yield = 1000.0  # Very high yield stress to prevent yielding
+    ve_model = ViscoelasticPlasticModel(
+        E_inf, E_i, rho_i, nu, high_yield, 'mixed',
+        {'a': 50.0, 'b': 10.0 * high_yield, 'c': 0.7, 
+         'c_kin': 0.3 * (E_inf + np.sum(E_i)) / (2 * (1 + nu)), 'gamma': 0.0}
+    )
+    
+    # Frequencies to test (logarithmic scale)
+    frequencies = np.logspace(-3, 3, 20)  # 0.001 Hz to 1000 Hz
+    
+    # Storage and loss moduli arrays
+    ve_storage = []
+    ve_loss = []
+    vep_storage = []
+    vep_loss = []
+    
+    # Strain amplitude small enough to stay mostly in linear viscoelastic range
+    strain_amplitude = 0.005
+    
+    plt.figure(figsize=(12, 10))
+    
+    # Simulate frequency sweep for both models
+    for freq in frequencies:
+        # For viscoelastic model
+        ve_time, ve_strain, ve_stress, _, _ = ve_model.simulate_cyclic_loading(
+            strain_amplitude, freq, 3, 20.0)  # 3 cycles at 20°C
+        
+        # For viscoelastic-plastic model
+        vep_time, vep_strain, vep_stress, _, _ = vep_model.simulate_cyclic_loading(
+            strain_amplitude, freq, 3, 20.0)  # 3 cycles at 20°C
+        
+        # Calculate complex modulus components (using last complete cycle)
+        cycle_length = int(len(ve_time) / 3)
+        start_idx = cycle_length  # Use second cycle
+        
+        # For viscoelastic model
+        ve_max_stress = np.max(ve_stress[start_idx:start_idx+cycle_length])
+        ve_min_stress = np.min(ve_stress[start_idx:start_idx+cycle_length])
+        ve_stress_amplitude = (ve_max_stress - ve_min_stress) / 2
+        
+        # Find phase shift using zero crossings (simplified approach)
+        ve_strain_zero = np.where(np.diff(np.signbit(ve_strain[start_idx:start_idx+cycle_length])))[0]
+        ve_stress_zero = np.where(np.diff(np.signbit(ve_stress[start_idx:start_idx+cycle_length])))[0]
+        if len(ve_strain_zero) > 0 and len(ve_stress_zero) > 0:
+            ve_phase_diff = abs(ve_stress_zero[0] - ve_strain_zero[0])
+            ve_phase_angle = ve_phase_diff / cycle_length * np.pi
+        else:
+            ve_phase_angle = 0
+        
+        ve_storage.append((ve_stress_amplitude / strain_amplitude) * np.cos(ve_phase_angle))
+        ve_loss.append((ve_stress_amplitude / strain_amplitude) * np.sin(ve_phase_angle))
+        
+        # Same for viscoelastic-plastic model
+        vep_max_stress = np.max(vep_stress[start_idx:start_idx+cycle_length])
+        vep_min_stress = np.min(vep_stress[start_idx:start_idx+cycle_length])
+        vep_stress_amplitude = (vep_max_stress - vep_min_stress) / 2
+        
+        vep_strain_zero = np.where(np.diff(np.signbit(vep_strain[start_idx:start_idx+cycle_length])))[0]
+        vep_stress_zero = np.where(np.diff(np.signbit(vep_stress[start_idx:start_idx+cycle_length])))[0]
+        if len(vep_strain_zero) > 0 and len(vep_stress_zero) > 0:
+            vep_phase_diff = abs(vep_stress_zero[0] - vep_strain_zero[0])
+            vep_phase_angle = vep_phase_diff / cycle_length * np.pi
+        else:
+            vep_phase_angle = 0
+        
+        vep_storage.append((vep_stress_amplitude / strain_amplitude) * np.cos(vep_phase_angle))
+        vep_loss.append((vep_stress_amplitude / strain_amplitude) * np.sin(vep_phase_angle))
+    
+    # Convert to numpy arrays
+    ve_storage = np.array(ve_storage)
+    ve_loss = np.array(ve_loss)
+    vep_storage = np.array(vep_storage)
+    vep_loss = np.array(vep_loss)
+
+def plot_multiple_cycle_comparison():
+    """
+    Compare the behavior of viscoelastic-only vs viscoelastic-plastic materials
+    over multiple loading cycles to highlight permanent deformation differences.
+    """
+    # Get Prony series parameters
+    E_inf, E_i, rho_i = fit_prony_nnls(num_terms=8)
+    nu = 0.35
+    yield_stress = 13  # MPa for the plastic model
+
+    # Create two models
+    vep_model = ViscoelasticPlasticModel(
+        E_inf, E_i, rho_i, nu, yield_stress, 'mixed',
+        {'a': 50.0, 'b': 10.0 * yield_stress, 'c': 0.7, 
+         'c_kin': 0.3 * (E_inf + np.sum(E_i)) / (2 * (1 + nu)), 'gamma': 0.0}
+    )
+    
+    high_yield = 1000.0  # Very high yield stress to prevent yielding
+    ve_model = ViscoelasticPlasticModel(
+        E_inf, E_i, rho_i, nu, high_yield, 'mixed',
+        {'a': 50.0, 'b': 10.0 * high_yield, 'c': 0.7, 
+         'c_kin': 0.3 * (E_inf + np.sum(E_i)) / (2 * (1 + nu)), 'gamma': 0.0}
+    )
+    
+    # Simulation parameters
+    strain_amplitude = 0.035  # Just above yield point
+    frequency = 0.1  # Hz
+    num_cycles = 5
+    temperature = 20.0  # °C
+    
+    # Run simulations
+    ve_time, ve_strain, ve_stress, _, _ = ve_model.simulate_cyclic_loading(
+        strain_amplitude, frequency, num_cycles, temperature)
+    
+    vep_time, vep_strain, vep_stress, vep_plastic, _ = vep_model.simulate_cyclic_loading(
+        strain_amplitude, frequency, num_cycles, temperature)
+    
+    plt.figure(figsize=(18, 12))
+    
+    # Plot strain vs time
+    plt.subplot(2, 2, 1)
+    plt.plot(ve_time, ve_strain, 'b-', linewidth=1.5, label='Viscoelastic Only')
+    plt.plot(vep_time, vep_strain, 'r-', linewidth=1.5, label='Viscoelastic-Plastic')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Strain')
+    plt.title('Strain vs Time Over Multiple Cycles')
+    plt.legend()
+    plt.grid(True)
+    
+    # Plot stress vs time
+    plt.subplot(2, 2, 2)
+    plt.plot(ve_time, ve_stress, 'b-', linewidth=1.5, label='Viscoelastic Only')
+    plt.plot(vep_time, vep_stress, 'r-', linewidth=1.5, label='Viscoelastic-Plastic')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Stress (MPa)')
+    plt.title('Stress vs Time Over Multiple Cycles')
+    plt.legend()
+    plt.grid(True)
+    
+    # Plot stress-strain curves
+    plt.subplot(2, 2, 3)
+    plt.plot(ve_strain, ve_stress, 'b-', linewidth=1, label='Viscoelastic Only')
+    plt.plot(vep_strain, vep_stress, 'r-', linewidth=1, label='Viscoelastic-Plastic')
+    # Highlight first and last cycles
+    cycles_per_period = int(len(ve_time) / num_cycles)
+    plt.plot(ve_strain[:cycles_per_period], ve_stress[:cycles_per_period], 'b-', linewidth=2, label='VE First Cycle')
+    plt.plot(ve_strain[-cycles_per_period:], ve_stress[-cycles_per_period:], 'b:', linewidth=2, label='VE Last Cycle')
+    plt.plot(vep_strain[:cycles_per_period], vep_stress[:cycles_per_period], 'r-', linewidth=2, label='VEP First Cycle')
+    plt.plot(vep_strain[-cycles_per_period:], vep_stress[-cycles_per_period:], 'r:', linewidth=2, label='VEP Last Cycle')
+    plt.xlabel('Strain')
+    plt.ylabel('Stress (MPa)')
+    plt.title('Stress-Strain Curves Over Multiple Cycles')
+    plt.legend()
+    plt.grid(True)
+    
+    # Plot plastic strain accumulation for VEP model
+    plt.subplot(2, 2, 4)
+    plt.plot(vep_time, vep_plastic, 'r-', linewidth=2, label='Plastic Strain')
+    
+    # Add markers at the end of each cycle
+    cycle_ends = []
+    for i in range(1, num_cycles + 1):
+        idx = int(i * len(vep_time) / num_cycles) - 1
+        cycle_ends.append(idx)
+        
+    plt.plot(vep_time[cycle_ends], vep_plastic[cycle_ends], 'ko', markersize=8, label='End of Cycle')
+    
+    plt.xlabel('Time (s)')
+    plt.ylabel('Accumulated Plastic Strain')
+    plt.title('Plastic Strain Accumulation in VEP Model')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig('multiple_cycle_comparison.png', dpi=300)
+    plt.show()
+
+
+def enhanced_main():
+    # Original example_usage()
+    example_usage()
+    
+    # Add our new comparison functions
+    compare_ve_vs_vep()
+    plot_frequency_domain_comparison()
+    plot_multiple_cycle_comparison()
+    
+    # Optional calibration
+    # model = calibrate_to_ideal_ct('Cell18_1.txt', model_type='mixed')
+
+
+if __name__ == "__main__":
+    enhanced_main()
